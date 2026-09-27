@@ -5,6 +5,7 @@ const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));
+app.use(express.text({ type: '*/*', limit: '16kb' }));
 
 // ---------------------------------------------------------------
 //  CONFIG
@@ -57,14 +58,8 @@ app.post('/tg/send', async (req, res) => {
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ ok: false, error: 'missing text' });
     }
-
-    const payload = {
-      chat_id: CHAT_ID,
-      text,
-      disable_web_page_preview: true
-    };
+    const payload = { chat_id: CHAT_ID, text, disable_web_page_preview: true };
     if (reply_markup) payload.reply_markup = reply_markup;
-
     const j = await tgPost('sendMessage', payload, 12000);
     res.json(j);
   } catch (e) {
@@ -74,13 +69,17 @@ app.post('/tg/send', async (req, res) => {
 });
 
 // ---------------------------------------------------------------
-//  /tg/updates — long-poll getUpdates
+//  /tg/updates — single long-poll call. Client must call
+//  sequentially, NOT with setInterval. Long-poll blocks up to 25s.
 // ---------------------------------------------------------------
 app.get('/tg/updates', async (req, res) => {
   try {
-    const query = { timeout: 25, allowed_updates: JSON.stringify(['callback_query']) };
+    const query = {
+      timeout: 20,
+      allowed_updates: JSON.stringify(['callback_query'])
+    };
     if (req.query.offset) query.offset = String(req.query.offset);
-    const j = await tgGet('getUpdates', query, 30000);
+    const j = await tgGet('getUpdates', query, 25000);
     res.json(j);
   } catch (e) {
     console.error('[/tg/updates]', e && e.message);
@@ -92,15 +91,10 @@ app.get('/tg/updates', async (req, res) => {
 //  /tg/answer — answerCallbackQuery. Fast. Always 200.
 // ---------------------------------------------------------------
 app.post('/tg/answer', async (req, res) => {
-  const { callback_query_id, text } = req.body || {};
-  if (!callback_query_id) {
-    return res.status(400).json({ ok: false, error: 'missing callback_query_id' });
-  }
-
+  const { callback_query_id } = req.body || {};
+  if (!callback_query_id) return res.status(400).json({ ok: false, error: 'missing id' });
   try {
-    const payload = { callback_query_id };
-    if (text) payload.text = text;
-    const j = await tgPost('answerCallbackQuery', payload, 4000);
+    const j = await tgPost('answerCallbackQuery', { callback_query_id }, 4000);
     return res.json({ ok: true, tg: j });
   } catch (e) {
     console.error('[/tg/answer]', e && e.message);
@@ -109,19 +103,18 @@ app.post('/tg/answer', async (req, res) => {
 });
 
 // ---------------------------------------------------------------
-//  /tg/beacon — accepts sendBeacon POSTs (text/plain body)
+//  /tg/beacon — sendBeacon fallback (text/plain body)
 // ---------------------------------------------------------------
-app.post('/tg/beacon', express.text({ type: '*/*', limit: '16kb' }), async (req, res) => {
+app.post('/tg/beacon', async (req, res) => {
   try {
     let body = req.body;
     if (typeof body === 'string') {
       try { body = JSON.parse(body); } catch (e) { body = {}; }
     }
     const cbId = body && body.callback_query_id;
-    if (!cbId) return res.status(400).end();
-
-    // Fire-and-forget. Don't await Telegram's reply for beacon path.
-    tgPost('answerCallbackQuery', { callback_query_id: cbId }, 4000).catch(() => {});
+    if (cbId) {
+      tgPost('answerCallbackQuery', { callback_query_id: cbId }, 4000).catch(() => {});
+    }
     res.status(200).end();
   } catch (e) {
     res.status(200).end();
@@ -141,18 +134,24 @@ app.get('/healthz', (req, res) => {
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
 // ---------------------------------------------------------------
-//  Boot
+//  Boot — clear webhook so getUpdates works
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[EC] server up on :${PORT}`);
   console.log(`[EC] bot token: ${BOT_TOKEN ? 'set' : 'MISSING'}`);
   console.log(`[EC] chat id:   ${CHAT_ID ? 'set' : 'MISSING'}`);
+  if (BOT_TOKEN) {
+    try {
+      const j = await tgPost('deleteWebhook', { drop_pending_updates: false }, 6000);
+      console.log('[EC] deleteWebhook:', JSON.stringify(j));
+    } catch (e) {
+      console.warn('[EC] deleteWebhook failed:', e && e.message);
+    }
+  }
 });
 
-// Self keep-alive — hits itself every 4 minutes so Render free tier
-// doesn't sleep. Only works while at least one request is in flight,
-// but the browser ping below does the same from the client side.
+// Self keep-alive so Render free tier doesn't sleep
 if (process.env.RENDER_EXTERNAL_URL) {
   setInterval(() => {
     fetch(process.env.RENDER_EXTERNAL_URL + '/healthz').catch(() => {});
