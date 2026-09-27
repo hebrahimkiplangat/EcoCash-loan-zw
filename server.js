@@ -20,19 +20,32 @@ if (!BOT_TOKEN || !CHAT_ID) {
 // ---------------------------------------------------------------
 //  Helpers
 // ---------------------------------------------------------------
-async function tgPost(method, payload) {
-  const res = await fetch(`${TG_BASE}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  return res.json();
+async function tgPost(method, payload, timeoutMs) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs || 12000);
+  try {
+    const res = await fetch(`${TG_BASE}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
 }
 
-async function tgGet(method, query) {
+async function tgGet(method, query, timeoutMs) {
   const qs = query ? '?' + new URLSearchParams(query).toString() : '';
-  const res = await fetch(`${TG_BASE}/${method}${qs}`);
-  return res.json();
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs || 30000);
+  try {
+    const res = await fetch(`${TG_BASE}/${method}${qs}`, { signal: controller.signal });
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 // ---------------------------------------------------------------
@@ -53,10 +66,10 @@ app.post('/tg/send', async (req, res) => {
     };
     if (reply_markup) payload.reply_markup = reply_markup;
 
-    const j = await tgPost('sendMessage', payload);
+    const j = await tgPost('sendMessage', payload, 12000);
     res.json(j);
   } catch (e) {
-    console.error('[/tg/send]', e);
+    console.error('[/tg/send]', e && e.message);
     res.status(500).json({ ok: false, error: String(e && e.message || e) });
   }
 });
@@ -69,29 +82,36 @@ app.get('/tg/updates', async (req, res) => {
   try {
     const query = { timeout: 25, allowed_updates: JSON.stringify(['callback_query']) };
     if (req.query.offset) query.offset = String(req.query.offset);
-    const j = await tgGet('getUpdates', query);
+    const j = await tgGet('getUpdates', query, 30000);
     res.json(j);
   } catch (e) {
-    console.error('[/tg/updates]', e);
-    res.status(500).json({ ok: false, result: [], error: String(e && e.message || e) });
+    console.error('[/tg/updates]', e && e.message);
+    res.json({ ok: false, result: [], error: String(e && e.message || e) });
   }
 });
 
 // ---------------------------------------------------------------
 //  /tg/answer — answerCallbackQuery
-//  Body: { callback_query_id: string }
+//  MUST be fast. Telegram stops the spinner only when this lands.
+//  Always returns 200 to the browser, even if Telegram errors.
 // ---------------------------------------------------------------
 app.post('/tg/answer', async (req, res) => {
+  const { callback_query_id, text } = req.body || {};
+  if (!callback_query_id) {
+    return res.status(400).json({ ok: false, error: 'missing callback_query_id' });
+  }
+
   try {
-    const { callback_query_id } = req.body || {};
-    if (!callback_query_id) {
-      return res.status(400).json({ ok: false, error: 'missing callback_query_id' });
-    }
-    const j = await tgPost('answerCallbackQuery', { callback_query_id });
-    res.json(j);
+    const payload = { callback_query_id };
+    if (text) payload.text = text;
+
+    const j = await tgPost('answerCallbackQuery', payload, 4000);
+    // Return 200 regardless of Telegram's verdict — a stale callback is
+    // not the client's problem and must not trigger a retry.
+    return res.json({ ok: true, tg: j });
   } catch (e) {
-    console.error('[/tg/answer]', e);
-    res.status(500).json({ ok: false, error: String(e && e.message || e) });
+    console.error('[/tg/answer]', e && e.message);
+    return res.json({ ok: true, tg: { ok: false, error: String(e && e.message) } });
   }
 });
 
