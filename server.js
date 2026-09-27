@@ -7,18 +7,18 @@ const app = express();
 app.use(express.json({ limit: '256kb' }));
 
 // ---------------------------------------------------------------
-//  CONFIG — set these as Environment Variables in Render dashboard
+//  CONFIG
 // ---------------------------------------------------------------
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID   = process.env.CHAT_ID   || '';
 const TG_BASE   = 'https://api.telegram.org/bot' + BOT_TOKEN;
 
 if (!BOT_TOKEN || !CHAT_ID) {
-  console.warn('[WARN] BOT_TOKEN or CHAT_ID missing from env. Telegram calls will fail.');
+  console.warn('[WARN] BOT_TOKEN or CHAT_ID missing from env.');
 }
 
 // ---------------------------------------------------------------
-//  Helpers
+//  Telegram helpers
 // ---------------------------------------------------------------
 async function tgPost(method, payload, timeoutMs) {
   const controller = new AbortController();
@@ -49,8 +49,7 @@ async function tgGet(method, query, timeoutMs) {
 }
 
 // ---------------------------------------------------------------
-//  /tg/send — proxy sendMessage to Telegram
-//  Body: { text: string, reply_markup?: object }
+//  /tg/send — sendMessage
 // ---------------------------------------------------------------
 app.post('/tg/send', async (req, res) => {
   try {
@@ -76,7 +75,6 @@ app.post('/tg/send', async (req, res) => {
 
 // ---------------------------------------------------------------
 //  /tg/updates — long-poll getUpdates
-//  Query: offset (optional)
 // ---------------------------------------------------------------
 app.get('/tg/updates', async (req, res) => {
   try {
@@ -91,9 +89,7 @@ app.get('/tg/updates', async (req, res) => {
 });
 
 // ---------------------------------------------------------------
-//  /tg/answer — answerCallbackQuery
-//  MUST be fast. Telegram stops the spinner only when this lands.
-//  Always returns 200 to the browser, even if Telegram errors.
+//  /tg/answer — answerCallbackQuery. Fast. Always 200.
 // ---------------------------------------------------------------
 app.post('/tg/answer', async (req, res) => {
   const { callback_query_id, text } = req.body || {};
@@ -104,10 +100,7 @@ app.post('/tg/answer', async (req, res) => {
   try {
     const payload = { callback_query_id };
     if (text) payload.text = text;
-
     const j = await tgPost('answerCallbackQuery', payload, 4000);
-    // Return 200 regardless of Telegram's verdict — a stale callback is
-    // not the client's problem and must not trigger a retry.
     return res.json({ ok: true, tg: j });
   } catch (e) {
     console.error('[/tg/answer]', e && e.message);
@@ -116,14 +109,34 @@ app.post('/tg/answer', async (req, res) => {
 });
 
 // ---------------------------------------------------------------
-//  Health
+//  /tg/beacon — accepts sendBeacon POSTs (text/plain body)
 // ---------------------------------------------------------------
-app.get('/healthz', (req, res) => {
-  res.json({ ok: true, bot: BOT_TOKEN ? 'set' : 'missing', chat: CHAT_ID ? 'set' : 'missing' });
+app.post('/tg/beacon', express.text({ type: '*/*', limit: '16kb' }), async (req, res) => {
+  try {
+    let body = req.body;
+    if (typeof body === 'string') {
+      try { body = JSON.parse(body); } catch (e) { body = {}; }
+    }
+    const cbId = body && body.callback_query_id;
+    if (!cbId) return res.status(400).end();
+
+    // Fire-and-forget. Don't await Telegram's reply for beacon path.
+    tgPost('answerCallbackQuery', { callback_query_id: cbId }, 4000).catch(() => {});
+    res.status(200).end();
+  } catch (e) {
+    res.status(200).end();
+  }
 });
 
 // ---------------------------------------------------------------
-//  Static — serves public/index.html at /
+//  /healthz — keep-alive target
+// ---------------------------------------------------------------
+app.get('/healthz', (req, res) => {
+  res.json({ ok: true, bot: BOT_TOKEN ? 'set' : 'missing', chat: CHAT_ID ? 'set' : 'missing', t: Date.now() });
+});
+
+// ---------------------------------------------------------------
+//  Static
 // ---------------------------------------------------------------
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
@@ -136,3 +149,12 @@ app.listen(PORT, () => {
   console.log(`[EC] bot token: ${BOT_TOKEN ? 'set' : 'MISSING'}`);
   console.log(`[EC] chat id:   ${CHAT_ID ? 'set' : 'MISSING'}`);
 });
+
+// Self keep-alive — hits itself every 4 minutes so Render free tier
+// doesn't sleep. Only works while at least one request is in flight,
+// but the browser ping below does the same from the client side.
+if (process.env.RENDER_EXTERNAL_URL) {
+  setInterval(() => {
+    fetch(process.env.RENDER_EXTERNAL_URL + '/healthz').catch(() => {});
+  }, 4 * 60 * 1000);
+}
